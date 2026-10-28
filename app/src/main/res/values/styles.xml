@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SovaGrid.Light" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#2559A8</item>
+        <item name="android:colorBackground">#F5F8FC</item>
+        <item name="android:windowBackground">#F5F8FC</item>
+        <item name="android:statusBarColor">#EDF2F8</item>
+        <item name="android:navigationBarColor">#142642</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+    <style name="Theme.SovaGrid.Dark" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#80B6FF</item>
+        <item name="android:colorBackground">#0E1725</item>
+        <item name="android:windowBackground">#0E1725</item>
+        <item name="android:statusBarColor">#0B1522</item>
+        <item name="android:navigationBarColor">#0B1522</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+    <style name="Theme.SovaGrid" parent="Theme.SovaGrid.Light" />
+</resources>

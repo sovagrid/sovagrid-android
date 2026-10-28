@@ -1,0 +1,55 @@
+name: First install on GitHub-hosted Ubuntu
+
+# A root installer must run only on a fresh GitHub-hosted VM. Fork PR code is
+# covered by unit tests; this integration job runs after merge or on dispatch.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ssh-core/**'
+      - 'ci/verify_first_install.py'
+      - '.github/workflows/first-install-integration.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: first-install-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  install:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK 36 for Gradle configuration
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Prepare private command export on disposable VM
+        run: |
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test -d /opt && test ! -L /opt
+          # GitHub's image can give /opt a nonstandard mode. Match a fresh
+          # Ubuntu server without relaxing run.sh's production safety check.
+          sudo -n install -d -o root -g root -m 0755 /opt
+          test "$(stat -c '%u:%a' /opt)" = 0:755
+          install -d -m 0700 "$RUNNER_TEMP/sovagrid-first-install-commands"
+          echo "SOVAGRID_CI_INSTALL_COMMAND_DIR=$RUNNER_TEMP/sovagrid-first-install-commands" >> "$GITHUB_ENV"
+          sudo -n systemctl --version >/dev/null
+          sudo -n systemd-run --version >/dev/null
+          sudo -n systemctl start docker
+          sudo -n docker info >/dev/null
+      - name: Export exact installer commands compiled into Android
+        run: ./gradlew --no-daemon --rerun-tasks :ssh-core:test --tests 'org.sovagrid.ssh.ServerBootstrapCiExportTest'
+      - name: Install the pinned server bundle and verify Hub and Agent
+        run: python3 ci/verify_first_install.py

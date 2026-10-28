@@ -1,0 +1,26 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: AGPL-3.0-only
+     Copyright (C) 2026 Jigokuraku01
+     Additional author attribution terms: see ATTRIBUTION.md. -->
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <meta name="color-scheme" content="light dark">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src data:; font-src 'self'; connect-src 'none'; frame-src 'none'; form-action 'none'; base-uri 'none'">
+  <link rel="stylesheet" href="vendor/xterm/xterm.css">
+  <style>
+    html, body, #terminal { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #101c2b; }
+    #terminal { box-sizing: border-box; padding: 4px; }
+    @media (prefers-color-scheme: light) {
+      html, body, #terminal { background: #f5f8fc; }
+    }
+  </style>
+</head>
+<body>
+  <div id="terminal"></div>
+  <script src="vendor/xterm/xterm.js"></script>
+  <script src="vendor/fit/addon-fit.js"></script>
+  <script src="terminal.js"></script>
+</body>
+</html>

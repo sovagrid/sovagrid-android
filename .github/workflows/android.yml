@@ -1,0 +1,103 @@
+name: Android
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - uses: android-actions/setup-android@v4
+      - name: Install Android SDK 36
+        run: sdkmanager 'platforms;android-36' 'build-tools;36.0.0'
+      - name: Prepare persistent preview signing
+        if: github.event_name != 'pull_request'
+        env:
+          PREVIEW_STORE_B64: ${{ secrets.SOVAGRID_ANDROID_PREVIEW_KEYSTORE_B64 }}
+          PREVIEW_STORE_PASSWORD: ${{ secrets.SOVAGRID_ANDROID_PREVIEW_STORE_PASSWORD }}
+        run: |
+          python3 - <<'PY'
+          import base64, os, pathlib, tempfile
+          if not os.environ.get("PREVIEW_STORE_B64") or not os.environ.get("PREVIEW_STORE_PASSWORD"):
+              raise SystemExit("Persistent preview signing secrets must be configured before a main build")
+          directory = pathlib.Path(tempfile.mkdtemp(prefix="sovagrid-signing-", dir=os.environ["RUNNER_TEMP"]))
+          os.chmod(directory, 0o700)
+          store = directory / "preview.p12"
+          with os.fdopen(os.open(store, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600), "wb") as output:
+              output.write(base64.b64decode(os.environ["PREVIEW_STORE_B64"], validate=True))
+          with open(os.environ["GITHUB_ENV"], "a") as output:
+              output.write(f"SOVAGRID_ANDROID_SIGNING_STORE_FILE={store}\n")
+          PY
+      - name: Test, lint, and build signed preview
+        if: github.event_name != 'pull_request'
+        env:
+          SOVAGRID_ANDROID_SIGNING_PASSWORD: ${{ secrets.SOVAGRID_ANDROID_PREVIEW_STORE_PASSWORD }}
+        run: ./gradlew --no-daemon :ssh-core:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest :app:assembleRelease
+      - name: Test, lint, and build pull request without signing secrets
+        if: github.event_name == 'pull_request'
+        run: ./gradlew --no-daemon :ssh-core:test :app:testDebugUnitTest :app:lintDebug :app:assembleDebug :app:assembleDebugAndroidTest
+      - name: Verify persistent preview certificate
+        if: github.event_name != 'pull_request'
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess
+          signer = pathlib.Path(os.environ["ANDROID_HOME"]) / "build-tools/36.0.0/apksigner"
+          expected = "00d6710507a15f068dd536bf7e0d60d3674317136d13d8abea6d15cd67c6d11d"
+          for variant in ("debug", "release"):
+              apk = pathlib.Path(f"app/build/outputs/apk/{variant}/app-{variant}.apk")
+              result = subprocess.run([str(signer), "verify", "--print-certs", str(apk)],
+                                      check=True, capture_output=True, text=True)
+              hashes = re.findall(r"Signer #\d+ certificate SHA-256 digest: ([0-9a-fA-F]+)", result.stdout)
+              if len(hashes) != 1 or hashes[0].lower() != expected:
+                  raise SystemExit(f"{variant} APK does not match the persistent SovaGrid preview certificate")
+              if variant == "release":
+                  aapt = signer.with_name("aapt")
+                  badging = subprocess.run([str(aapt), "dump", "badging", str(apk)],
+                                           check=True, capture_output=True, text=True).stdout
+                  source = pathlib.Path("app/build.gradle.kts").read_text()
+                  code = re.search(r"^\s*versionCode\s*=\s*(\d+)", source, re.MULTILINE)
+                  name = re.search(r'^\s*versionName\s*=\s*"([^"]+)"', source, re.MULTILINE)
+                  if (code is None or name is None or "application-debuggable" in badging or
+                      f"versionCode='{code.group(1)}'" not in badging or
+                      f"versionName='{name.group(1)}'" not in badging):
+                      raise SystemExit("Release APK has an unexpected debug flag or version")
+              print("Verified", variant, "SovaGrid preview certificate SHA-256:", expected)
+          PY
+      - name: Upload persistently signed preview APK
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sovagrid-android-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Upload signed release preview APK
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sovagrid-android-release
+          path: app/build/outputs/apk/release/app-release.apk
+      - name: Remove temporary signing store
+        if: always() && github.event_name != 'pull_request'
+        run: |
+          python3 - <<'PY'
+          import os, pathlib
+          value = os.environ.get("SOVAGRID_ANDROID_SIGNING_STORE_FILE")
+          if value:
+              store = pathlib.Path(value)
+              store.unlink(missing_ok=True)
+              store.parent.rmdir()
+          PY
