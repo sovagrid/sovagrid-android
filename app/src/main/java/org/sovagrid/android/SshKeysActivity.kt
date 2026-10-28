@@ -134,6 +134,12 @@ class SshKeysActivity : Activity() {
                     putExtra(Intent.EXTRA_TITLE, "sovagrid-${key.id.take(8)}.pub")
                 }, EXPORT_PUBLIC_KEY)
             })
+            if (intent.getBooleanExtra(SELECT_KEY, false)) {
+                addView(button("Использовать для подключения") {
+                    setResult(RESULT_OK, Intent().setData(Uri.parse(SshKeyReference.uri(key.id))))
+                    finish()
+                })
+            }
         }
         AlertDialog.Builder(this).setTitle(key.label).setView(ScrollView(this).apply { addView(body) })
             .setPositiveButton("Готово", null).show()
