@@ -623,7 +623,7 @@ class PanelActivity : Activity() {
                 pendingInstall?.let(::discardPendingInstall)
                 try {
                     startActivity(Intent(Intent.ACTION_VIEW,
-                        Uri.parse("https://github.com/sovagrid/sovagrid-blueprint/releases/tag/server-v0.12.0")))
+                        Uri.parse("https://github.com/sovagrid/sovagrid-blueprint/releases/tag/server-v0.13.0")))
                 } catch (_: ActivityNotFoundException) {
                     Toast.makeText(this, "Не удалось открыть страницу загрузки", Toast.LENGTH_LONG).show()
                 }

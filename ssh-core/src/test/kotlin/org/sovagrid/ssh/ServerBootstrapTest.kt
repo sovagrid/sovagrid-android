@@ -16,7 +16,7 @@ class ServerBootstrapTest {
     @Test fun fixedDetachedInstallerIsDigestPinnedAndSyntaxValid() {
         val command = ServerBootstrap.START_COMMAND
         assertTrue(command.contains("systemd-run --quiet --collect --unit=sovagrid-first-install"))
-        assertTrue(command.contains("server-v0.12.0/SovaGrid-server-source.tar.gz"))
+        assertTrue(command.contains("server-v0.13.0/SovaGrid-server-source.tar.gz"))
         assertTrue(command.contains(ServerBootstrap.EXPECTED_SOURCE_SHA256))
         assertTrue(command.contains(ServerBootstrap.EXPECTED_MANIFEST_SHA256))
         assertTrue(command.contains("/run/sovagrid-first-install.lock"))
