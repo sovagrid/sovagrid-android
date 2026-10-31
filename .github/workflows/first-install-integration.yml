@@ -1,14 +1,8 @@
 name: First install on GitHub-hosted Ubuntu
 
-# A root installer must run only on a fresh GitHub-hosted VM. Fork PR code is
-# covered by unit tests; this integration job runs after merge or on dispatch.
+# A root installer must run only on a fresh GitHub-hosted VM. The integration
+# job is manually dispatched to conserve CI quota.
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'ssh-core/**'
-      - 'ci/verify_first_install.py'
-      - '.github/workflows/first-install-integration.yml'
   workflow_dispatch:
 
 permissions:
