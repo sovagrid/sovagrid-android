@@ -42,6 +42,9 @@ class MainActivity : Activity() {
     private val worker = Executors.newSingleThreadExecutor()
     private var currentServer: SavedServer? = null
     private var connection: ShellConnection? = null
+    private var pendingFirstConnect: SessionSshCredential? = null
+    private var firstPasswordDiscarded = false
+    private var sessionHandoff: SessionSshHandoff? = null
     private var selectedKeyUri: Uri? = null
     private var selectedJumpKeyUri: Uri? = null
     @Volatile private var disposed = false
@@ -124,6 +127,11 @@ class MainActivity : Activity() {
         terminalSurface = null
         terminalButtons.clear()
         clearSecretFields()
+        pendingFirstConnect?.clear()
+        pendingFirstConnect = null
+        firstPasswordDiscarded = false
+        sessionHandoff?.clear()
+        sessionHandoff = null
         currentServer = null
         selectedKeyUri = null
         selectedJumpKeyUri = null
@@ -226,6 +234,10 @@ class MainActivity : Activity() {
         }
         val username = input("Пользователь")
         listOf(name, host, port, username).forEach { form.addView(it) }
+        val firstPassword = input("SSH-пароль для первого входа (не сохраняется)", true)
+        form.addView(firstPassword)
+        val firstPasswordHelp = label("После проверки отпечатка сервера приложение подключится с этим паролем. Для входа по ключу оставьте поле пустым.")
+        form.addView(firstPasswordHelp)
         val viaHost = CheckBox(this).apply { text = "Через промежуточный SSH-хост (ProxyJump)" }
         val jumpHost = input("IP или адрес промежуточного хоста")
         val jumpPort = input("SSH-порт промежуточного хоста").apply {
@@ -236,14 +248,18 @@ class MainActivity : Activity() {
         listOf(viaHost, jumpHost, jumpPort, jumpUsername).forEach { form.addView(it) }
         viaHost.setOnCheckedChangeListener { _, enabled ->
             listOf(jumpHost, jumpPort, jumpUsername).forEach { it.visibility = if (enabled) View.VISIBLE else View.GONE }
+            firstPassword.visibility = if (enabled) View.GONE else View.VISIBLE
+            firstPasswordHelp.visibility = if (enabled) View.GONE else View.VISIBLE
+            if (enabled) firstPassword.text?.clear()
         }
         listOf(jumpHost, jumpPort, jumpUsername).forEach { it.visibility = View.GONE }
         val dialog = AlertDialog.Builder(this)
             .setTitle("Новый сервер")
             .setView(ScrollView(this).apply { addView(form) })
-            .setPositiveButton("Сохранить", null)
+            .setPositiveButton("Открыть SSH", null)
             .setNegativeButton("Отмена", null)
             .create()
+        dialog.setOnDismissListener { firstPassword.text?.clear() }
         dialog.setOnShowListener {
             dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener {
                 val endpoint = runCatching {
@@ -260,18 +276,26 @@ class MainActivity : Activity() {
                     host.error = "Проверьте адрес, порт, пользователя и название"
                     return@setOnClickListener
                 }
-                hosts.add(name.text.toString(), endpoint, gateway)
+                val firstCredential = if (!viaHost.isChecked && firstPassword.text?.isNotEmpty() == true)
+                    SessionSshCredential.Password(secret(firstPassword)) else null
+                val server = hosts.add(name.text.toString(), endpoint, gateway)
                 dialog.dismiss()
-                showServerList()
+                showTerminal(server, firstCredential)
             }
         }
         dialog.show()
     }
 
-    private fun showTerminal(server: SavedServer) {
+    private fun showTerminal(server: SavedServer, firstCredential: SessionSshCredential? = null) {
         screenGeneration++
         connectionAttempt++
         probing = false
+        clearSecretFields()
+        pendingFirstConnect?.clear()
+        pendingFirstConnect = firstCredential
+        firstPasswordDiscarded = false
+        sessionHandoff?.clear()
+        sessionHandoff = null
         terminalSurface?.closeSurface()
         terminalSurface = null
         val staleConnection = connection
@@ -447,6 +471,19 @@ class MainActivity : Activity() {
             text = "Отключиться"
             setOnClickListener { disconnectCurrent() }
         })
+        root.addView(Button(this).apply {
+            text = "Панель / установка SovaGrid через SSH"
+            isAllCaps = false
+            setOnClickListener {
+                if (connection?.isOpen == true) {
+                    sessionHandoff?.let {
+                        EphemeralSshHandoff.offer(it)
+                        sessionHandoff = null
+                    }
+                }
+                startActivity(Intent(this@MainActivity, PanelActivity::class.java).putExtra("server_id", server.id))
+            }
+        })
         setContentView(root)
 
         updateTrustState(server)
@@ -454,6 +491,8 @@ class MainActivity : Activity() {
             probeHost(server, gateway = true)
         } else if (server.jumpEndpoint == null && hosts.pin(server.id) == null) {
             probeHost(server, gateway = false)
+        } else if (firstCredential != null && server.jumpEndpoint == null) {
+            connectWithFirstCredential(server)
         }
         appendOutput("SovaGrid SSH · коснитесь экрана для клавиатуры; команды остаются в одной сессии.\r\n")
     }
@@ -494,21 +533,21 @@ class MainActivity : Activity() {
         }
     }
 
-    private fun gatewayCredentialsRequest(): CredentialsRequest? {
+    private fun gatewayCredentialsRequest(): SessionSshCredential? {
         if (jumpKeyRadio?.isChecked == true) {
             val uri = selectedJumpKeyUri
             if (uri == null) {
                 status.text = "Сначала выберите приватный ключ промежуточного хоста."
                 return null
             }
-            return CredentialsRequest.Key(uri, secret(jumpPassphraseField!!))
+            return SessionSshCredential.Key(uri, secret(jumpPassphraseField!!))
         }
-        return CredentialsRequest.Password(secret(jumpPasswordField!!))
+        return SessionSshCredential.Password(secret(jumpPasswordField!!))
     }
 
-    private fun authentication(request: CredentialsRequest): Authentication = when (request) {
-        is CredentialsRequest.Password -> Authentication.Password(request.chars)
-        is CredentialsRequest.Key -> Authentication.PrivateKey(readKeyText(request.uri), request.passphrase)
+    private fun authentication(request: SessionSshCredential): Authentication = when (request) {
+        is SessionSshCredential.Password -> Authentication.Password(request.chars)
+        is SessionSshCredential.Key -> Authentication.PrivateKey(readKeyText(request.uri), request.passphrase)
     }
 
     private fun probeHost(server: SavedServer, gateway: Boolean) {
@@ -551,16 +590,23 @@ class MainActivity : Activity() {
                             if (hosts.setPin(server.id, observed.wireBase64, gateway)) {
                                 status.text = "Ключ подтверждён: ${observed.fingerprintSha256}"
                                 updateTrustState(server)
+                                if (!gateway && server.jumpEndpoint == null) connectWithFirstCredential(server)
                             } else {
                                 status.text = "Не удалось сохранить ключ; подключение заблокировано."
+                                pendingFirstConnect?.clear()
+                                pendingFirstConnect = null
                             }
                         }
                         .setNegativeButton("Отмена") { _, _ ->
                             status.text = "Ключ не подтверждён; подключение заблокировано."
+                            pendingFirstConnect?.clear()
+                            pendingFirstConnect = null
                             updateTrustState(server)
                         }
                         .setOnCancelListener {
                             status.text = "Ключ не подтверждён; подключение заблокировано."
+                            pendingFirstConnect?.clear()
+                            pendingFirstConnect = null
                             updateTrustState(server)
                         }
                         .show()
@@ -569,6 +615,8 @@ class MainActivity : Activity() {
                 postUi {
                     if (screenGeneration != generation || currentServer?.id != server.id) return@postUi
                     probing = false
+                    pendingFirstConnect?.clear()
+                    pendingFirstConnect = null
                     updateTrustState(server)
                     status.text = when (error) {
                         is HostKeyChangedException -> "Ключ промежуточного узла изменился. Вход заблокирован; проверьте его независимо."
@@ -624,16 +672,6 @@ class MainActivity : Activity() {
         }
     }
 
-    private sealed interface CredentialsRequest {
-        fun clear()
-        class Password(val chars: CharArray) : CredentialsRequest {
-            override fun clear() = chars.fill('\u0000')
-        }
-        class Key(val uri: Uri, val passphrase: CharArray) : CredentialsRequest {
-            override fun clear() = passphrase.fill('\u0000')
-        }
-    }
-
     private fun secret(field: EditText): CharArray {
         val value = field.text
         val chars = CharArray(value.length) { value[it] }
@@ -641,27 +679,39 @@ class MainActivity : Activity() {
         return chars
     }
 
-    private fun connect(server: SavedServer) {
-        val pin = hosts.pin(server.id) ?: return
-        val gatewayPin = if (server.jumpEndpoint != null) hosts.pin(server.id, gateway = true) ?: return else null
-        if (connection != null || currentServer?.id != server.id) return
+    private fun connectWithFirstCredential(server: SavedServer) {
+        val credential = pendingFirstConnect ?: return
+        pendingFirstConnect = null
+        if (currentServer?.id == server.id && hosts.pin(server.id) != null) connect(server, credential)
+        else credential.clear()
+    }
+
+    private fun connect(server: SavedServer, firstCredential: SessionSshCredential? = null) {
+        val pin = hosts.pin(server.id) ?: run { firstCredential?.clear(); return }
+        val gatewayPin = if (server.jumpEndpoint != null)
+            hosts.pin(server.id, gateway = true) ?: run { firstCredential?.clear(); return } else null
+        if (connection != null || currentServer?.id != server.id) {
+            firstCredential?.clear()
+            return
+        }
         val generation = screenGeneration
         val attempt = ++connectionAttempt
-        val surface = terminalSurface ?: return
+        val surface = terminalSurface ?: run { firstCredential?.clear(); return }
         val initialColumns = terminalColumns
         val initialRows = terminalRows
-        val request = if (keyRadio.isChecked) {
+        val request = firstCredential ?: if (keyRadio.isChecked) {
             val uri = selectedKeyUri
             if (uri == null) {
                 status.text = "Сначала выберите приватный ключ."
                 return
             }
-            CredentialsRequest.Key(uri, secret(passphraseField))
-        } else CredentialsRequest.Password(secret(passwordField))
+            SessionSshCredential.Key(uri, secret(passphraseField))
+        } else SessionSshCredential.Password(secret(passwordField))
         val gatewayRequest = if (server.jumpEndpoint != null) gatewayCredentialsRequest() ?: run {
             request.clear()
             return
         } else null
+        val reusable = SessionSshHandoff(server.id, request.duplicate(), gatewayRequest?.duplicate())
         connectButton.isEnabled = false
         status.text = "Подключаемся и проверяем сохранённые ключи…"
         worker.execute {
@@ -678,6 +728,8 @@ class MainActivity : Activity() {
                             if (screenGeneration == generation && connectionAttempt == attempt &&
                                 currentServer?.id == server.id && connection?.isOpen == false) {
                                 connection = null
+                                sessionHandoff?.clear()
+                                sessionHandoff = null
                                 status.text = "Сервер закрыл соединение."
                                 connectButton.isEnabled = true
                                 commandField.isEnabled = false
@@ -697,12 +749,14 @@ class MainActivity : Activity() {
                     if (disposed || screenGeneration != generation || connectionAttempt != attempt ||
                         currentServer?.id != server.id) {
                         closeAsync(opened)
+                        reusable.clear()
                         return@runOnUiThread
                     }
                     // The shell can exit before this UI callback runs. In that case
                     // onClosed saw no connection yet, so restore the retry controls here.
                     if (!opened.isOpen) {
                         closeAsync(opened)
+                        reusable.clear()
                         status.text = "Сервер закрыл соединение."
                         connectButton.isEnabled = true
                         commandField.isEnabled = false
@@ -712,6 +766,8 @@ class MainActivity : Activity() {
                         return@runOnUiThread
                     }
                     connection = opened
+                    sessionHandoff?.clear()
+                    sessionHandoff = reusable
                     status.text = if (route == null) "Подключено. Ключ сервера совпал с сохранённым."
                     else "Подключено через промежуточный узел. Оба ключа совпали с сохранёнными."
                     commandField.isEnabled = true
@@ -724,6 +780,7 @@ class MainActivity : Activity() {
                     appendOutput("\r\n[SSH-сессия открыта]\r\n")
                 }
             } catch (error: Exception) {
+                reusable.clear()
                 postUi {
                     if (screenGeneration != generation || connectionAttempt != attempt ||
                         currentServer?.id != server.id) return@postUi
@@ -835,6 +892,8 @@ class MainActivity : Activity() {
         val old = connection ?: return
         connectionAttempt++
         connection = null
+        sessionHandoff?.clear()
+        sessionHandoff = null
         commandField.isEnabled = false
         sendButton.isEnabled = false
         terminalButtons.forEach { it.isEnabled = false }
@@ -873,6 +932,10 @@ class MainActivity : Activity() {
         terminalSurface?.closeSurface()
         terminalSurface = null
         clearSecretFields()
+        pendingFirstConnect?.clear()
+        pendingFirstConnect = null
+        sessionHandoff?.clear()
+        sessionHandoff = null
         val old = connection
         connection = null
         worker.execute { old?.close() }
@@ -881,8 +944,25 @@ class MainActivity : Activity() {
     }
 
     override fun onStop() {
+        // PanelActivity consumes its one-time handoff in onCreate before this
+        // onStop during normal in-app navigation. A still-pending value means
+        // the app left the foreground before the handoff completed.
+        EphemeralSshHandoff.clearPending()
+        if (pendingFirstConnect != null) {
+            pendingFirstConnect?.clear()
+            pendingFirstConnect = null
+            firstPasswordDiscarded = true
+        }
         if (connection != null) disconnectCurrent()
         super.onStop()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        if (firstPasswordDiscarded && currentServer != null && ::status.isInitialized) {
+            status.text = "Пароль первого входа очищен при выходе из приложения. Введите его снова после проверки ключа."
+            firstPasswordDiscarded = false
+        }
     }
 
     companion object {

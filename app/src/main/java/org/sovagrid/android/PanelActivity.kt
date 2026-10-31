@@ -93,6 +93,8 @@ class PanelActivity : Activity() {
     private var profileSaveInProgress = false
     private var selectedKeyUri: Uri? = null
     private var selectedGatewayKeyUri: Uri? = null
+    private var initialHandoff: SessionSshHandoff? = null
+    @Volatile private var activeHandoff: SessionSshHandoff? = null
     @Volatile private var disposed = false
     @Volatile private var visible = false
     private var opening = false
@@ -135,6 +137,7 @@ class PanelActivity : Activity() {
             return
         }
         server = saved
+        initialHandoff = EphemeralSshHandoff.take(saved.id)
         usesGatewayPin = saved.jumpEndpoint != null
         endpoint = saved.jumpEndpoint ?: saved.endpoint
         showLogin()
@@ -385,30 +388,20 @@ class PanelActivity : Activity() {
         }
     }
 
-    private fun gatewayCredentialsRequest(): CredentialsRequest? {
+    private fun gatewayCredentialsRequest(): SessionSshCredential? {
         if (gatewayKeyRadio?.isChecked == true) {
             val uri = selectedGatewayKeyUri ?: run {
                 status.text = "Сначала выберите приватный ключ промежуточного узла."
                 return null
             }
-            return CredentialsRequest.Key(uri, secret(gatewayPassphraseField!!))
+            return SessionSshCredential.Key(uri, secret(gatewayPassphraseField!!))
         }
-        return CredentialsRequest.Password(secret(gatewayPasswordField!!))
+        return SessionSshCredential.Password(secret(gatewayPasswordField!!))
     }
 
-    private sealed interface CredentialsRequest {
-        fun clear()
-        class Password(val chars: CharArray) : CredentialsRequest {
-            override fun clear() = chars.fill('\u0000')
-        }
-        class Key(val uri: Uri, val passphrase: CharArray) : CredentialsRequest {
-            override fun clear() = passphrase.fill('\u0000')
-        }
-    }
-
-    private fun authentication(request: CredentialsRequest): Authentication = when (request) {
-        is CredentialsRequest.Password -> Authentication.Password(request.chars)
-        is CredentialsRequest.Key -> Authentication.PrivateKey(readKeyText(request.uri), request.passphrase)
+    private fun authentication(request: SessionSshCredential): Authentication = when (request) {
+        is SessionSshCredential.Password -> Authentication.Password(request.chars)
+        is SessionSshCredential.Key -> Authentication.PrivateKey(readKeyText(request.uri), request.passphrase)
     }
 
     private fun choosePrivateKey(requestCode: Int) = SshKeyPicker.choose(this, requestCode)
@@ -475,23 +468,33 @@ class PanelActivity : Activity() {
         return chars
     }
 
-    private fun openPanel() {
-        if (opening || probing) return
+    private fun openPanel(preset: SessionSshHandoff? = null) {
+        if (opening || probing) { preset?.clear(); return }
         val destination = endpoint
         val viaTarget = targetDestination
-        val pin = hosts.pin(server.id, usesGatewayPin) ?: return
-        val gatewayPin = if (viaTarget) hosts.pin(server.id, gateway = true) ?: return else null
-        val request = if (keyRadio.isChecked) {
+        val pin = hosts.pin(server.id, usesGatewayPin) ?: run { preset?.clear(); return }
+        val gatewayPin = if (viaTarget) hosts.pin(server.id, gateway = true) ?: run {
+            preset?.clear(); return
+        } else null
+        val handedOff = if (viaTarget || server.jumpEndpoint == null) preset?.target else preset?.gateway
+        if (preset != null && handedOff == null) {
+            preset.clear()
+            status.text = "Данные SSH-сеанса недоступны. Введите их снова."
+            return
+        }
+        val request = handedOff ?: if (keyRadio.isChecked) {
             val uri = selectedKeyUri ?: run {
                 status.text = "Сначала выберите приватный ключ ${if (viaTarget) "конечного сервера" else "SSH-хоста"}."
                 return
             }
-            CredentialsRequest.Key(uri, secret(passphraseField))
-        } else CredentialsRequest.Password(secret(passwordField))
-        val gatewayRequest = if (viaTarget) gatewayCredentialsRequest() ?: run {
+            SessionSshCredential.Key(uri, secret(passphraseField))
+        } else SessionSshCredential.Password(secret(passwordField))
+        val gatewayRequest = if (viaTarget) (preset?.gateway ?: gatewayCredentialsRequest()) ?: run {
             request.clear()
+            preset?.clear()
             return
         } else null
+        activeHandoff = preset
         opening = true
         updateTrustState()
         status.text = if (viaTarget) "Проверяем ключи промежуточного и конечного узлов, открываем SSH-туннель…"
@@ -589,6 +592,8 @@ class PanelActivity : Activity() {
             } finally {
                 request.clear()
                 gatewayRequest?.clear()
+                preset?.clear()
+                if (activeHandoff === preset) activeHandoff = null
             }
         }
     }
@@ -618,7 +623,7 @@ class PanelActivity : Activity() {
                 pendingInstall?.let(::discardPendingInstall)
                 try {
                     startActivity(Intent(Intent.ACTION_VIEW,
-                        Uri.parse("https://github.com/sovagrid/sovagrid-blueprint/releases/tag/v0.10.0-preview")))
+                        Uri.parse("https://github.com/sovagrid/sovagrid-blueprint/releases/tag/server-v0.11.0")))
                 } catch (_: ActivityNotFoundException) {
                     Toast.makeText(this, "Не удалось открыть страницу загрузки", Toast.LENGTH_LONG).show()
                 }
@@ -1253,10 +1258,18 @@ class PanelActivity : Activity() {
     override fun onStart() {
         super.onStart()
         visible = true
+        initialHandoff?.let { handoff ->
+            initialHandoff = null
+            openPanel(handoff)
+        }
     }
 
     override fun onStop() {
         visible = false
+        initialHandoff?.clear()
+        initialHandoff = null
+        activeHandoff?.clear()
+        activeHandoff = null
         nativeGrantEligible = false
         nativeGrantRequest++
         bootstrapRequest++
@@ -1288,6 +1301,10 @@ class PanelActivity : Activity() {
         pendingProfile?.bytes?.fill(0)
         pendingProfile = null
         clearSecretFields()
+        initialHandoff?.clear()
+        initialHandoff = null
+        activeHandoff?.clear()
+        activeHandoff = null
         selectedKeyUri = null
         selectedGatewayKeyUri = null
         disposeBrowser()

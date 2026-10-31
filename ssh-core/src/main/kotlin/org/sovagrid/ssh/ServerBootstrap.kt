@@ -10,10 +10,10 @@ data class FirstInstallJob(val state: FirstInstallState, val stage: String = "",
 
 /** A fixed, detached root job survives phone backgrounding and can be reattached read-only. */
 object ServerBootstrap {
-    const val VERSION = "0.10.0"
-    const val EXPECTED_SOURCE_SHA256 = "275c5f03c30b1a924b1fcb48067a41f7b76481cd4c249589a7c8b5098db749fb"
-    const val EXPECTED_MANIFEST_SHA256 = "2314f9b66ca1d70dba1e348ceb93e99367c5a074ceb370dc307f0dab4a877a03"
-    private const val BUNDLE_URL = "https://github.com/sovagrid/sovagrid-blueprint/releases/download/v0.10.0-preview/SovaGrid-server-source-0.10.0-preview.tar.gz"
+    const val VERSION = "0.11.0"
+    const val EXPECTED_SOURCE_SHA256 = "10abb18ca39d789d3a9cc8bd04d36126f6dd624a81e48219bd814fb6a15ab766"
+    const val EXPECTED_MANIFEST_SHA256 = "a0e34d21e059ed6519710b7c441e995f390eca93fdf809aaea7da688d9e67389"
+    private const val BUNDLE_URL = "https://github.com/sovagrid/sovagrid-blueprint/releases/download/server-v0.11.0/SovaGrid-server-source.tar.gz"
     const val MAX_OUTPUT_BYTES = 160
     private val stages = setOf("START", "DOWNLOAD", "VERIFY", "EXTRACT", "RUN", "CHECK")
     private val reasons = setOf("ROOT", "UBUNTU", "EXISTING", "UNKNOWN", "DOWNLOAD", "DOWNLOAD_TOOL", "HASH", "ARCHIVE", "LAYOUT", "STAGE", "RUN", "RESULT", "INTERRUPTED")
