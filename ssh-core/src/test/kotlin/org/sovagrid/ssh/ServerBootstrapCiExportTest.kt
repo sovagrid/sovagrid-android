@@ -23,7 +23,8 @@ class ServerBootstrapCiExportTest {
         assertTrue(start.contains(ServerBootstrap.EXPECTED_MANIFEST_SHA256))
         assertEquals(0, ProcessBuilder("/bin/bash", "-n", "-c", start).start().waitFor())
         assertEquals(0, ProcessBuilder("/bin/sh", "-n", "-c", status).start().waitFor())
-        for ((name, command) in listOf("start.command" to start, "status.command" to status)) {
+        for ((name, command) in listOf("start.command" to start, "status.command" to status,
+            "probe.command" to ServerDeploymentProbe.READ_COMMAND, "password.command" to BootstrapPassword.READ_COMMAND)) {
             val target = root.resolve(name)
             Files.writeString(target, command, StandardCharsets.UTF_8,
                 StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)

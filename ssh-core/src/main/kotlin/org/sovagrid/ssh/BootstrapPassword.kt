@@ -7,7 +7,8 @@ import java.io.IOException
 
 /** Only the installer-generated URL-safe password is accepted from the fixed SSH command. */
 object BootstrapPassword {
-    const val READ_COMMAND = "head -c 257 /etc/sovagrid/admin-password"
+    const val READ_COMMAND = "/usr/bin/head -c 257 /etc/sovagrid/admin-password 2>/dev/null || " +
+        "{ [ -x /usr/bin/sudo ] && exec /usr/bin/sudo -n -- /usr/bin/head -c 257 /etc/sovagrid/admin-password; }"
 
     fun parse(output: ByteArray, length: Int = output.size): CharArray {
         if (length !in 0..output.size) throw IOException("Unexpected initial password format")

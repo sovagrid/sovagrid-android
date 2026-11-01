@@ -16,10 +16,15 @@ class ServerBootstrapTest {
     @Test fun fixedDetachedInstallerIsDigestPinnedAndSyntaxValid() {
         val command = ServerBootstrap.START_COMMAND
         assertTrue(command.contains("systemd-run --quiet --collect --unit=sovagrid-first-install"))
-        assertTrue(command.contains("server-v0.14.1/SovaGrid-server-source.tar.gz"))
+        assertTrue(command.startsWith("set -- /bin/sh -c '"))
+        assertTrue(command.contains("exec /usr/bin/sudo -n -- \"\$@\""))
+        assertTrue(!command.contains("sudo -S"))
+        assertTrue(ServerBootstrap.STATUS_COMMAND.contains("/usr/bin/sudo -n /bin/sh -c"))
+        assertTrue(command.contains("server-v${ServerBootstrap.VERSION}/SovaGrid-server-source.tar.gz"))
         assertTrue(command.contains(ServerBootstrap.EXPECTED_SOURCE_SHA256))
         assertTrue(command.contains(ServerBootstrap.EXPECTED_MANIFEST_SHA256))
         assertTrue(command.contains("/run/sovagrid-first-install.lock"))
+        assertTrue(command.contains("/run/sovagrid-installation.lock"))
         assertTrue(command.contains("/var/lib/sovagrid-first-install"))
         assertTrue(command.contains("head -c 67108865"))
         assertEquals(0, ProcessBuilder("/bin/bash", "-n", "-c", command).start().waitFor())

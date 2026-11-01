@@ -8,16 +8,26 @@ import android.app.Instrumentation
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.content.ContentValues
 import android.graphics.Rect
 import android.os.Bundle
 import android.os.SystemClock
 import android.system.Os
+import android.os.CancellationSignal
+import android.provider.MediaStore
 import android.view.View
 import android.view.ViewGroup
 import android.view.MotionEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import org.json.JSONObject
 import org.sovagrid.ssh.SshClientCore
+import org.sovagrid.ssh.Endpoint
+import android.net.Uri
+import android.webkit.WebView
+import androidx.webkit.WebViewFeature
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import java.io.File
 import java.security.KeyStore
 import java.util.UUID
@@ -26,10 +36,18 @@ import java.util.UUID
 class SshKeyVaultInstrumentation : Instrumentation() {
     private var mode = "full"
     private var publicSaveStage = "opening public key"
+        set(value) {
+            field = value
+            if (mode.startsWith("panel-")) android.util.Log.d("SovaGridUITest", value)
+        }
     private var publicSaveName = ""
     private var publicSaveBytes = 0
+    private var fixtureArguments = Bundle()
+    private var fixturePublicKey: String? = null
+    private var fixtureBrowserState: String? = null
     override fun onCreate(arguments: Bundle?) {
         super.onCreate(arguments)
+        this.fixtureArguments = arguments ?: Bundle()
         mode = arguments?.getString("mode") ?: "full"
         start()
     }
@@ -44,10 +62,14 @@ class SshKeyVaultInstrumentation : Instrumentation() {
                 when (mode) {
                     "public-ui" -> publicCopy(vault)
                     "public-save-ui" -> publicSave(vault)
+                    "panel-files-setup" -> panelFilesSetup(vault)
+                    "panel-files-ui" -> panelFiles(vault)
+                    "panel-restore-ui" -> panelRestore(vault)
                     else -> updatePersistence(vault)
                 }
                 finish(Activity.RESULT_OK, Bundle().apply {
                     putString("result", "$mode passed")
+                    fixturePublicKey?.let { putString("public_key", it) }
                     if (mode == "public-save-ui") {
                         putString("filename", publicSaveName)
                         putInt("public_bytes", publicSaveBytes)
@@ -87,7 +109,8 @@ class SshKeyVaultInstrumentation : Instrumentation() {
             finish(Activity.RESULT_OK, Bundle().apply { putString("result", "Keystore generation, persistence, tamper rejection and deletion passed") })
         } catch (error: Exception) {
             finish(Activity.RESULT_CANCELED, Bundle().apply {
-                putString("error", "${if (mode == "public-save-ui") publicSaveStage else stage}: ${error.javaClass.simpleName}")
+                putString("error", "${if (mode == "public-save-ui" || mode.startsWith("panel-")) publicSaveStage else stage}: ${error.javaClass.simpleName}")
+                fixtureBrowserState?.let { putString("browser_state", it) }
             })
         } finally { keyId?.let { runCatching { vault.delete(it) } } }
     }
@@ -187,8 +210,8 @@ class SshKeyVaultInstrumentation : Instrumentation() {
     }
 
     private fun waitNode(predicate: (AccessibilityNodeInfo) -> Boolean): AccessibilityNodeInfo? {
-        val deadline = System.currentTimeMillis() + 10_000
-        while (System.currentTimeMillis() < deadline) {
+        val deadline = SystemClock.uptimeMillis() + 10_000
+        while (SystemClock.uptimeMillis() < deadline) {
             findNode(uiAutomation.rootInActiveWindow, predicate)?.let { return it }
             Thread.sleep(100)
         }
@@ -208,11 +231,41 @@ class SshKeyVaultInstrumentation : Instrumentation() {
         val bounds = Rect().also(node::getBoundsInScreen)
         val time = SystemClock.uptimeMillis()
         val down = MotionEvent.obtain(time, time, MotionEvent.ACTION_DOWN, bounds.exactCenterX(), bounds.exactCenterY(), 0)
-        val up = MotionEvent.obtain(time, time + 50, MotionEvent.ACTION_UP, bounds.exactCenterX(), bounds.exactCenterY(), 0)
         down.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
-        up.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
-        return try { uiAutomation.injectInputEvent(down, true) && uiAutomation.injectInputEvent(up, true) }
-        finally { down.recycle(); up.recycle() }
+        return try {
+            if (!uiAutomation.injectInputEvent(down, true)) false else {
+                SystemClock.sleep(60)
+                val up = MotionEvent.obtain(time, SystemClock.uptimeMillis(), MotionEvent.ACTION_UP,
+                    bounds.exactCenterX(), bounds.exactCenterY(), 0)
+                up.source = android.view.InputDevice.SOURCE_TOUCHSCREEN
+                try { uiAutomation.injectInputEvent(up, true) } finally { up.recycle() }
+            }
+        } finally { down.recycle() }
+    }
+
+    // Older DocumentsUI selection filters require a finger tool type; the
+    // simple MotionEvent factory (and old adb input) leaves it UNKNOWN.
+    private fun fingerTouchNode(node: AccessibilityNodeInfo): Boolean {
+        val bounds = Rect().also(node::getBoundsInScreen)
+        val downTime = SystemClock.uptimeMillis()
+        val pointer = arrayOf(MotionEvent.PointerProperties().apply {
+            id = 0; toolType = MotionEvent.TOOL_TYPE_FINGER
+        })
+        val coords = arrayOf(MotionEvent.PointerCoords().apply {
+            x = bounds.exactCenterX(); y = bounds.exactCenterY(); pressure = 1f; size = 1f
+        })
+        fun event(action: Int) = MotionEvent.obtain(downTime, SystemClock.uptimeMillis(), action,
+            1, pointer, coords, 0, 0, 1f, 1f, 0, 0,
+            android.view.InputDevice.SOURCE_TOUCHSCREEN, 0)
+        val down = event(MotionEvent.ACTION_DOWN)
+        return try {
+            check(down.getToolType(0) == MotionEvent.TOOL_TYPE_FINGER)
+            if (!uiAutomation.injectInputEvent(down, true)) false else {
+                SystemClock.sleep(60)
+                val up = event(MotionEvent.ACTION_UP)
+                try { uiAutomation.injectInputEvent(up, true) } finally { up.recycle() }
+            }
+        } finally { down.recycle() }
     }
 
     private fun publicCopy(vault: SshKeyVault) {
@@ -273,5 +326,253 @@ class SshKeyVaultInstrumentation : Instrumentation() {
             }
             else -> error("Unknown test mode")
         }
+    }
+
+    private fun panelFilesSetup(vault: SshKeyVault) {
+        val marker = targetContext.getSharedPreferences("sovagrid_panel_file_test", 0)
+        check(!marker.contains("key"))
+        val username = fixtureArguments.getString("username") ?: error("Fixture username required")
+        val pin = fixtureArguments.getString("pin") ?: error("Fixture public host key required")
+        val key = vault.create("Disposable panel file fixture")
+        val store = HostStore(targetContext)
+        val server = store.add("Disposable panel file fixture", Endpoint("10.0.2.2", 22224, username))
+        check(store.setPin(server.id, pin))
+        check(marker.edit().putString("key", key.id).putString("server", server.id).commit())
+        fixturePublicKey = key.publicKey
+    }
+
+    private fun panelFiles(vault: SshKeyVault) {
+        val marker = targetContext.getSharedPreferences("sovagrid_panel_file_test", 0)
+        val key = marker.getString("key", null) ?: error("Missing fixture key")
+        val server = marker.getString("server", null) ?: error("Missing fixture server")
+        var activity: Activity? = null
+        try {
+            publicSaveStage = "opening actual panel through local SSH"
+            runOnMainSync {
+                EphemeralSshHandoff.offer(SessionSshHandoff(server,
+                    SessionSshCredential.Key(Uri.parse(SshKeyReference.uri(key)), charArrayOf()), null))
+            }
+            activity = startActivitySync(Intent(targetContext, PanelActivity::class.java)
+                .putExtra("server_id", server).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            check(waitNode { it.text?.toString() == "LOCAL PANEL FIXTURE" } != null)
+            fixtureBrowserState = "message_listener=${WebViewFeature.isFeatureSupported(WebViewFeature.WEB_MESSAGE_LISTENER)} " +
+                panelJavaScript(activity, "JSON.stringify({installed:globalThis.__sovagridNativeFilesInstalled,bridge:typeof globalThis.sovagridNativeFiles?.postMessage,origin:location.origin,width:innerWidth,height:innerHeight})")
+            for ((label, filename) in listOf("Download private HTTP" to "panel-native.bin", "Download binary Blob" to "panel-blob.bin")) {
+                publicSaveStage = "starting $filename"
+                val link = waitNode { it.text?.toString() == label } ?: error("Download control missing")
+                val bounds = Rect().also(link::getBoundsInScreen)
+                check(touchNode(link))
+                publicSaveStage = "confirming native download $filename"
+                fixtureBrowserState += " touch="+bounds.toShortString()+" "+panelJavaScript(activity,
+                    "JSON.stringify({installed:globalThis.__sovagridNativeFilesInstalled,bridge:typeof globalThis.sovagridNativeFiles?.postMessage})")
+                check(waitNode { it.text?.toString().equals("Скачать", ignoreCase = true) }?.let(::clickNode) == true)
+                publicSaveStage = "waiting system save picker for $filename"
+                check(waitNode { it.packageName?.toString()?.contains("documentsui") == true } != null)
+                publicSaveStage = "selecting Downloads for $filename"
+                findNode(uiAutomation.rootInActiveWindow) {
+                    it.contentDescription?.toString() in listOf("Show roots", "Open navigation drawer")
+                }?.let { check(clickNode(it)) }
+                val downloads = waitNode { it.text?.toString() in listOf("Downloads", "Загрузки") }
+                if (downloads != null) check(touchNode(downloads))
+                val name = waitNode { it.isEditable && it.className?.toString() == "android.widget.EditText" }
+                    ?: error("Filename field unavailable")
+                check(name.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, filename)
+                }))
+                publicSaveStage = "saving $filename through system picker"
+                check(waitNode { it.text?.toString().equals("Save", true) || it.text?.toString() == "Сохранить" }
+                    ?.let(::clickNode) == true)
+                check(waitNode { it.text?.toString() == "LOCAL PANEL FIXTURE" } != null)
+                val bytes = shellBytes("cat /sdcard/Download/$filename")
+                val expected = if (filename == "panel-native.bin")
+                    byteArrayOf(0, 1, 2, 0, -1, -128) + ByteArray(200000) { (it % 251).toByte() }
+                    else ByteArray(140003) { (it % 251).toByte() }
+                check(bytes.contentEquals(expected))
+            }
+            publicSaveStage = "opening actual WebView upload chooser"
+            check(waitNode { it.text?.toString()?.contains("Choose downloaded file") == true }?.let(::touchNode) == true)
+            check(waitNode { it.packageName?.toString()?.contains("documentsui") == true } != null)
+            // Older DocumentsUI exposes both the folder heading and its drawer
+            // entry as "Downloads". Select the last visible match, as in publicSave().
+            if (findNode(uiAutomation.rootInActiveWindow) { it.text?.toString() == "panel-native.bin" } == null) {
+                findNode(uiAutomation.rootInActiveWindow) {
+                    it.contentDescription?.toString() in listOf("Show roots", "Open navigation drawer")
+                }?.let { check(clickNode(it)) }
+                Thread.sleep(300)
+                val downloads = uiAutomation.rootInActiveWindow?.findAccessibilityNodeInfosByText("Downloads").orEmpty()
+                    .filter { it.isVisibleToUser && it.text?.toString() == "Downloads" }
+                check(downloads.lastOrNull()?.let(::touchNode) == true)
+            }
+            publicSaveStage = "selecting saved binary for WebView input"
+            if (android.os.Build.VERSION.SDK_INT <= 30) {
+                // The old grid separates preview, selection and activation
+                // hotspots. Use its standard list row for an unambiguous tap.
+                findNode(uiAutomation.rootInActiveWindow) {
+                    it.contentDescription?.toString() in listOf("List view", "Список")
+                }?.let { check(clickNode(it)) }
+            }
+            check(waitNode { it.text?.toString() == "panel-native.bin" && !it.isEditable }?.let {
+                val selectedBounds = Rect().also(it::getBoundsInScreen)
+                fixtureBrowserState += " picked="+it.className+":"+selectedBounds.toShortString()
+                if (android.os.Build.VERSION.SDK_INT <= 30) {
+                    fingerTouchNode(it)
+                } else clickNode(it) || touchNode(it)
+            } == true)
+            Thread.sleep(300)
+            if (uiAutomation.rootInActiveWindow?.packageName?.toString()?.contains("documentsui") == true) {
+                findNode(uiAutomation.rootInActiveWindow) {
+                    it.text?.toString() in listOf("Open", "OPEN", "Select", "SELECT", "Открыть", "Выбрать") ||
+                        it.contentDescription?.toString() in listOf("Open", "Select", "Открыть", "Выбрать")
+                }?.let { check(clickNode(it)) }
+            }
+            publicSaveStage = "checking exact uploaded bytes through private content provider"
+            val uploaded = waitNode { it.text?.toString() == "UPLOAD_OK 200006" }
+            if (uploaded == null) {
+                fixtureBrowserState += " upload="+panelJavaScript(activity,
+                    "JSON.stringify({result:document.querySelector('#result').textContent,file:document.querySelector('#upload').files[0]?.name,size:document.querySelector('#upload').files[0]?.size,subtle:typeof crypto.subtle})")
+                fixtureBrowserState += " picker="+activity.javaClass.getDeclaredField("uploadPickerActive").let {
+                    it.isAccessible = true; it.get(activity)
+                }+" snapshots="+activity.javaClass.getDeclaredField("uploadFiles").let {
+                    it.isAccessible = true; (it.get(activity) as Collection<*>).size
+                }+" window="+uiAutomation.rootInActiveWindow?.packageName
+                val labels = mutableListOf<String>()
+                fun describe(node: AccessibilityNodeInfo?) {
+                    if (node == null) return
+                    if (node.isVisibleToUser && (node.text != null || node.contentDescription != null))
+                        labels.add("${node.text ?: node.contentDescription}[enabled=${node.isEnabled},selected=${node.isSelected}]")
+                    for (index in 0 until node.childCount) describe(node.getChild(index))
+                }
+                describe(uiAutomation.rootInActiveWindow)
+                fixtureBrowserState += " picker_labels="+labels.take(24).joinToString("|")
+                uiAutomation.takeScreenshot()?.let { screenshot ->
+                    File(targetContext.cacheDir, "panel-picker-diagnostic.png").outputStream().use {
+                        screenshot.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, it)
+                    }
+                    screenshot.recycle()
+                }
+            }
+            check(uploaded != null)
+        } finally {
+            if (uiAutomation.rootInActiveWindow?.packageName?.toString()?.contains("documentsui") == true) {
+                uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+                Thread.sleep(200)
+            }
+            activity?.let { runOnMainSync { it.finish() } }
+            shell("rm -f /sdcard/Download/panel-native.bin")
+            shell("rm -f /sdcard/Download/panel-blob.bin")
+            HostStore(targetContext).remove(server)
+            vault.delete(key)
+            check(marker.edit().clear().commit())
+        }
+    }
+
+    private fun panelRestore(vault: SshKeyVault) {
+        val marker = targetContext.getSharedPreferences("sovagrid_panel_file_test", 0)
+        val key = marker.getString("key", null) ?: error("Missing fixture key")
+        val server = marker.getString("server", null) ?: error("Missing fixture server")
+        val resolver = targetContext.contentResolver
+        var activity: Activity? = null
+        var uri: Uri? = null
+        try {
+            publicSaveStage = "creating synthetic 8MiB regular restore document"
+            uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "panel-restore.bin")
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "Download")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }) ?: error("Synthetic document unavailable")
+            val size = 8 * 1024 * 1024 + 23
+            resolver.openOutputStream(uri, "w")!!.use { output ->
+                var offset = 0
+                while (offset < size) {
+                    val chunk = ByteArray(minOf(65536, size-offset)) { ((offset + it) % 251).toByte() }
+                    output.write(chunk); offset += chunk.size
+                }
+            }
+            resolver.update(uri, ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }, null, null)
+            publicSaveStage = "checking retained regular FD, ranges, mutation and release"
+            val proof = PanelRestoreFiles()
+            val selected = proof.add(resolver, uri, CancellationSignal())
+            try {
+            publicSaveStage = "checking retained FD size"
+            check(selected.size == size.toLong())
+            publicSaveStage = "checking retained FD bytes at nonzero offset"
+            check(proof.read(selected.handle, 4_194_301, 64).contentEquals(ByteArray(64) { ((4_194_301+it)%251).toByte() }))
+            publicSaveStage = "checking retained FD range refusal"
+            check(runCatching { proof.read(selected.handle, -1, 1) }.isFailure)
+            check(runCatching { proof.read(selected.handle, size.toLong(), 1) }.isFailure)
+            check(runCatching { proof.read(selected.handle, 0, 262145) }.isFailure)
+            resolver.openFileDescriptor(uri, "rw")!!.use { fd -> Os.pwrite(fd.fileDescriptor, byteArrayOf(1), 0, 1, 0) }
+            publicSaveStage = "checking retained FD mutation refusal"
+            check(runCatching { proof.read(selected.handle, 0, 1) }.isFailure)
+            } finally { proof.close() }
+            check(runCatching { proof.read(selected.handle, 0, 1) }.isFailure)
+            resolver.openFileDescriptor(uri, "rw")!!.use { fd -> Os.pwrite(fd.fileDescriptor, byteArrayOf(0), 0, 1, 0) }
+            publicSaveStage = "opening actual restore panel through SSH"
+            runOnMainSync {
+                EphemeralSshHandoff.offer(SessionSshHandoff(server,
+                    SessionSshCredential.Key(Uri.parse(SshKeyReference.uri(key)), charArrayOf()), null))
+            }
+            activity = startActivitySync(Intent(targetContext, PanelActivity::class.java)
+                .putExtra("server_id", server).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            check(waitNode { it.text?.toString() == "NATIVE_RESTORE_READY" } != null)
+            publicSaveStage = "opening dedicated native restore picker"
+            check(waitNode { it.text?.toString() == "Choose backup files" }?.let(::touchNode) == true)
+            check(waitNode { it.packageName?.toString()?.contains("documentsui") == true } != null)
+            if (findNode(uiAutomation.rootInActiveWindow) { it.text?.toString() == "panel-restore.bin" } == null) {
+                findNode(uiAutomation.rootInActiveWindow) {
+                    it.contentDescription?.toString() in listOf("Show roots", "Open navigation drawer")
+                }?.let { check(clickNode(it)) }
+                val downloads = waitNode { it.text?.toString() == "Downloads" } ?: error("Downloads unavailable")
+                check(touchNode(downloads))
+            }
+            findNode(uiAutomation.rootInActiveWindow) { it.contentDescription?.toString() == "List view" }
+                ?.let { check(clickNode(it)) }
+            val file = waitNode { it.text?.toString() == "panel-restore.bin" } ?: error("Synthetic restore document missing")
+            check(fingerTouchNode(file))
+            Thread.sleep(200)
+            if (uiAutomation.rootInActiveWindow?.packageName?.toString()?.contains("documentsui") == true) {
+                findNode(uiAutomation.rootInActiveWindow) {
+                    it.text?.toString() in listOf("Open", "OPEN", "Select", "SELECT", "Открыть", "Выбрать")
+                }?.let { check(clickNode(it)) }
+            }
+            publicSaveStage = "hashing bounded native slices and verifying explicit release"
+            val deadline = SystemClock.uptimeMillis() + 30000
+            var completed = false
+            while (SystemClock.uptimeMillis() < deadline) {
+                if (findNode(uiAutomation.rootInActiveWindow) { it.text?.toString() == "RESTORE_OK" } != null) {
+                    completed = true; break
+                }
+                Thread.sleep(100)
+            }
+            fixtureBrowserState = panelJavaScript(activity, "document.querySelector('#result').textContent")
+            check(completed)
+            runOnMainSync {
+                check(activity.javaClass.getDeclaredField("restoreFiles").let { it.isAccessible = true; it.get(activity) } == null)
+            }
+        } finally {
+            if (uiAutomation.rootInActiveWindow?.packageName?.toString()?.contains("documentsui") == true)
+                uiAutomation.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+            activity?.let { runOnMainSync { it.finish() } }
+            uri?.let { resolver.delete(it, null, null) }
+            HostStore(targetContext).remove(server); vault.delete(key)
+            check(marker.edit().clear().commit())
+        }
+    }
+
+    private fun panelJavaScript(activity: Activity, expression: String): String {
+        val result = AtomicReference<String>()
+        val latch = CountDownLatch(1)
+        runOnMainSync {
+            fun find(view: View): WebView? {
+                if (view is WebView) return view
+                if (view is ViewGroup) for (i in 0 until view.childCount) find(view.getChildAt(i))?.let { return it }
+                return null
+            }
+            val view = find(activity.window.decorView) ?: error("Panel WebView unavailable")
+            view.evaluateJavascript(expression) { value -> result.set(value); latch.countDown() }
+        }
+        check(latch.await(10, TimeUnit.SECONDS))
+        return result.get()
     }
 }

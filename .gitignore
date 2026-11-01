@@ -11,3 +11,5 @@ captures/
 *.jks
 *.pem
 *.key
+__pycache__/
+*.py[cod]

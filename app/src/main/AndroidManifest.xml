@@ -10,6 +10,9 @@
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.SovaGrid">
+        <provider android:name=".PanelUploadProvider"
+            android:authorities="${applicationId}.panel-files"
+            android:exported="false" android:grantUriPermissions="true" />
         <activity android:name=".AboutActivity" android:exported="false" />
         <activity android:name=".HubActivity" android:exported="false" />
         <activity android:name=".SshKeysActivity" android:exported="false" android:configChanges="orientation|screenSize|keyboardHidden" />

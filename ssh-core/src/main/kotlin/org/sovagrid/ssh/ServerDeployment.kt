@@ -69,8 +69,8 @@ object ServerDeploymentProbe {
 
     private val quotedScript = "'" + script.replace("'", "'\\''") + "'"
 
-    val READ_COMMAND = "if [ \"\$(id -u)\" = 0 ]; then /bin/sh -c $quotedScript; " +
-        "elif command -v sudo >/dev/null 2>&1; then " +
-        "sudo -n /bin/sh -c $quotedScript 2>/dev/null || printf 'SG_STATUS_V1:unknown\\n'; " +
+    val READ_COMMAND = "if [ \"\$(/usr/bin/id -u)\" = 0 ]; then /bin/sh -c $quotedScript; " +
+        "elif [ -x /usr/bin/sudo ]; then " +
+        "/usr/bin/sudo -n /bin/sh -c $quotedScript 2>/dev/null || printf 'SG_STATUS_V1:unknown\\n'; " +
         "else printf 'SG_STATUS_V1:unknown\\n'; fi"
 }

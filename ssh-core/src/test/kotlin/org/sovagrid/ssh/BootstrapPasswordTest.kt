@@ -5,6 +5,7 @@ package org.sovagrid.ssh
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import java.io.IOException
 import java.nio.charset.StandardCharsets
@@ -29,6 +30,8 @@ class BootstrapPasswordTest {
     }
 
     @Test fun commandIsFixedAndBounded() {
-        assertArrayEquals("head -c 257 /etc/sovagrid/admin-password".toCharArray(), BootstrapPassword.READ_COMMAND.toCharArray())
+        assertTrue(BootstrapPassword.READ_COMMAND.contains("/usr/bin/head -c 257 /etc/sovagrid/admin-password"))
+        assertTrue(BootstrapPassword.READ_COMMAND.contains("/usr/bin/sudo -n -- /usr/bin/head -c 257 /etc/sovagrid/admin-password"))
+        assertTrue(!BootstrapPassword.READ_COMMAND.contains("sudo -S"))
     }
 }

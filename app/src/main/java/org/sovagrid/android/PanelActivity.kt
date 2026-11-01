@@ -16,12 +16,14 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
+import android.os.CancellationSignal
 import android.os.PersistableBundle
 import android.text.InputType
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.webkit.WebChromeClient
+import android.webkit.ValueCallback
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -35,6 +37,8 @@ import android.widget.RadioGroup
 import android.widget.ScrollView
 import android.widget.TextView
 import android.widget.Toast
+import android.provider.OpenableColumns
+import android.provider.DocumentsContract
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import androidx.webkit.WebSettingsCompat
@@ -54,12 +58,17 @@ import org.sovagrid.ssh.FirstInstallState
 import java.io.ByteArrayOutputStream
 import java.io.ByteArrayInputStream
 import java.io.IOException
+import java.io.File
+import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.Proxy
 import java.net.URL
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.util.concurrent.Executors
+import java.util.UUID
+import org.json.JSONArray
+import java.util.Base64
 
 /** The full Hub UI is loaded from the selected SSH host's loopback over verified SSH hops. */
 class PanelActivity : Activity() {
@@ -91,6 +100,23 @@ class PanelActivity : Activity() {
     private var pendingProfile: ProfileSaveRequest? = null
     private var profilePickerActive = false
     private var profileSaveInProgress = false
+    private val fileWorker = Executors.newSingleThreadExecutor()
+    private var panelDownload: PanelDownloadFile? = null
+    private var fileDownloadDialog: AlertDialog? = null
+    private var fileSavePickerActive = false
+    private var fileSaveInProgress = false
+    private var uploadChooser: ValueCallback<Array<Uri>>? = null
+    private var uploadPickerActive = false
+    private val uploadFiles = mutableListOf<PanelUploadFile>()
+    private var restoreSession = UUID.randomUUID().toString().replace("-", "")
+    private var restoreFiles: PanelRestoreFiles? = null
+    private var restoreOpeningFiles: PanelRestoreFiles? = null
+    private var restoreOpenSignal: CancellationSignal? = null
+    private var restoreReadId: String? = null
+    private var restorePicker: RestorePicker? = null
+    private var nextRestorePickerCode = 2000
+    private data class RestorePicker(val code: Int, val request: PanelRestoreMessage, val view: WebView)
+    @Volatile private var uploadInput: InputStream? = null
     private var selectedKeyUri: Uri? = null
     private var selectedGatewayKeyUri: Uri? = null
     private var initialHandoff: SessionSshHandoff? = null
@@ -127,6 +153,9 @@ class PanelActivity : Activity() {
     private var gatewayKeyButton: Button? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Only these app-private temporary namespaces belong to panel transfers.
+        File(cacheDir, "panel-downloads").deleteRecursively()
+        File(cacheDir, "panel-uploads").deleteRecursively()
         AppTheme.apply(this)
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -409,6 +438,25 @@ class PanelActivity : Activity() {
     @Deprecated("The platform document picker is used on API 26+.")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
+        if (requestCode in 2000..60000) {
+            val pending = restorePicker
+            if (pending != null && pending.code == requestCode) {
+                restorePicker = null
+                val uris = if (resultCode != RESULT_OK) emptyList() else
+                    data?.clipData?.let { clip -> (0 until clip.itemCount).map { clip.getItemAt(it).uri } }
+                        ?: listOfNotNull(data?.data)
+                receiveRestoreSelection(pending, uris)
+            }
+            return
+        }
+        if (requestCode == REQUEST_PANEL_UPLOAD) {
+            receivePanelUpload(if (resultCode == RESULT_OK) data?.data else null)
+            return
+        }
+        if (requestCode == REQUEST_SAVE_PANEL_FILE) {
+            receivePanelSave(if (resultCode == RESULT_OK) data?.data else null)
+            return
+        }
         if (requestCode == REQUEST_PRIVATE_KEY && resultCode == RESULT_OK) {
             val uri = data?.data
             if (!hosts.recordKeySelection(server.id, uri?.let { SshKeyReference.id(it.toString()) }, gateway = usesGatewayPin)) {
@@ -542,7 +590,7 @@ class PanelActivity : Activity() {
                             "Установка завершилась, но управляемый Hub не подтверждён. Проверьте сервер.")
                         return@runOnUiThread
                     }
-                    if (deployment == ServerDeployment.MISSING && destination.username == "root" &&
+                    if (deployment == ServerDeployment.MISSING &&
                         installJob.state == FirstInstallState.NONE) {
                         tunnel = opened
                         updateTrustState()
@@ -602,8 +650,8 @@ class PanelActivity : Activity() {
         val (title, detail) = when (deployment) {
             ServerDeployment.MISSING -> "SovaGrid ещё не установлен" to
                 if (pendingInstall != null)
-                    "Установить SovaGrid ${ServerBootstrap.VERSION} на ${endpoint.username}@${endpoint.host}? Сервер загрузит официальный пакет, сверит SHA-256 и повторно проверит, что на нём нет SovaGrid. Затем будут установлены Docker, локальные Hub и Agent. Установка может занять несколько минут. Панель откроется здесь после проверки."
-                else "Для первой установки нужен вход root по SSH. Можно использовать SovaGrid Starter на компьютере."
+                    "Установить SovaGrid ${ServerBootstrap.VERSION} на ${endpoint.username}@${endpoint.host}? Сервер загрузит официальный пакет, сверит SHA-256 и повторно проверит, что на нём нет SovaGrid. Затем настроит Docker, локальные Hub и Agent, терминал, файлы, мониторинг контейнеров и управление WireGuard. VPN-интерфейс включается отдельно в панели. Установка может занять несколько минут. Панель откроется здесь после проверки."
+                else "Для первой установки нужны root или права sudo без запроса пароля. Пароль SSH не заменяет разрешение sudo. Можно использовать SovaGrid Starter на компьютере."
             ServerDeployment.AGENT_ONLY -> "На сервере работает Agent" to
                 "Здесь установлен только Agent. Полная установка поверх него могла бы затронуть существующий туннель и ключи. Для конечного сервера выберите «Hub на промежуточном узле»; перенос на самостоятельный Hub будет отдельной безопасной операцией."
             ServerDeployment.CONFLICT -> "Найдена неполная установка" to
@@ -824,10 +872,35 @@ class PanelActivity : Activity() {
                 WebSettingsCompat.setAlgorithmicDarkeningAllowed(settings, AppTheme.isDark(this@PanelActivity))
             }
             settings.allowFileAccess = false
-            settings.allowContentAccess = false
+            // File inputs receive only user-selected private snapshots from our provider.
+            // The request interceptor still blocks content: navigation and fetches.
+            settings.allowContentAccess = true
             settings.mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
             settings.setSupportMultipleWindows(true)
             webChromeClient = object : WebChromeClient() {
+                override fun onShowFileChooser(view: WebView, callback: ValueCallback<Array<Uri>>,
+                                               parameters: FileChooserParams): Boolean {
+                    if (view !== browser || !panelReady(port) || uploadChooser != null ||
+                        panelDownload != null || profilePickerActive || profileSaveInProgress ||
+                        uploadFiles.size >= 16 || restorePicker != null || restoreOpenSignal != null ||
+                        parameters.mode != FileChooserParams.MODE_OPEN) {
+                        callback.onReceiveValue(null); return true
+                    }
+                    uploadChooser = callback
+                    uploadPickerActive = true
+                    try {
+                        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = "*/*"
+                            putExtra(Intent.EXTRA_ALLOW_MULTIPLE, false)
+                            putExtra(Intent.EXTRA_TITLE, "Один файл до 4 МБ для текущей панели")
+                        }, REQUEST_PANEL_UPLOAD)
+                    } catch (_: Exception) {
+                        uploadChooser = null; uploadPickerActive = false
+                        callback.onReceiveValue(null)
+                    }
+                    return true
+                }
                 override fun onCreateWindow(view: WebView, isDialog: Boolean,
                                             isUserGesture: Boolean, resultMsg: Message): Boolean {
                     if (!isUserGesture || view !== browser || !panelReady(port)) return false
@@ -879,6 +952,8 @@ class PanelActivity : Activity() {
                 }
 
                 override fun onPageStarted(view: WebView, url: String, favicon: android.graphics.Bitmap?) {
+                    closeRestoreAccess()
+                    restoreSession = UUID.randomUUID().toString().replace("-", "")
                     nativePageGeneration++
                     nativePageFailed = false
                     nativeGrantButton?.isEnabled = false
@@ -900,6 +975,8 @@ class PanelActivity : Activity() {
                 }
 
                 override fun onPageFinished(view: WebView, url: String) {
+                    if (allowed(Uri.parse(url))) view.evaluateJavascript(PanelFileTransferScript.source, null)
+                    if (allowed(Uri.parse(url))) view.evaluateJavascript(PanelRestoreScript.source(restoreSession, panelOrigin), null)
                     bootstrapButton?.isEnabled = panelReady(port) && !nativePageFailed
                     nativeGrantButton?.isEnabled = managed && panelReady(port) &&
                         !nativePageFailed && url == panelHome(port)
@@ -923,6 +1000,18 @@ class PanelActivity : Activity() {
                     sourceView, message, sourceOrigin, isMainFrame, _ ->
                 acceptProfileMessage(sourceView, message.data, sourceOrigin, isMainFrame, port)
             }
+            WebViewCompat.addWebMessageListener(view, "sovagridNativeFiles", setOf(panelOrigin)) {
+                    sourceView, message, sourceOrigin, isMainFrame, _ ->
+                acceptPanelFileMessage(sourceView, message.data, sourceOrigin, isMainFrame, port)
+            }
+            WebViewCompat.addWebMessageListener(view, "sovagridRestoreChannel", setOf(panelOrigin)) {
+                    sourceView, message, sourceOrigin, isMainFrame, _ ->
+                acceptRestoreMessage(sourceView, message.data, sourceOrigin, isMainFrame, port)
+            }
+        } else {
+            layout.addView(TextView(this).apply {
+                text = "Для скачивания файлов и VPN-профилей обновите Android System WebView. Остальные разделы панели доступны."
+            })
         }
         browser = view
         bootstrapButton = Button(this).apply {
@@ -1093,7 +1182,7 @@ class PanelActivity : Activity() {
                 bootstrapButton?.isEnabled = true
                 if (password == null) {
                     Toast.makeText(this,
-                        "Нет доступа к начальному паролю. Подключитесь SSH-пользователем с правом чтения файла (обычно root).",
+                        "Нет доступа к начальному паролю. Нужны права чтения файла или sudo без запроса пароля.",
                         Toast.LENGTH_LONG).show()
                 } else {
                     showBootstrapPassword(password, port)
@@ -1200,6 +1289,7 @@ class PanelActivity : Activity() {
         if (!isMainFrame || sourceView !== browser || !visible || disposed || isFinishing ||
             tunnel?.isOpen != true || activeTunnelPort != port ||
             profilePickerActive || profileSaveInProgress || pendingProfile != null ||
+            panelDownload != null || fileDownloadDialog != null || uploadChooser != null ||
             sourceOrigin.scheme != "http" || sourceOrigin.authority != "127.0.0.1:$port" ||
             sourceOrigin.path !in listOf(null, "", "/") || sourceOrigin.query != null || sourceOrigin.fragment != null ||
             sourceView.url?.let { url ->
@@ -1231,6 +1321,257 @@ class PanelActivity : Activity() {
         }
     }
 
+    private fun replyPanelFile(view: WebView, message: PanelFileMessage, accepted: Boolean) {
+        if (disposed || view !== browser) return
+        view.evaluateJavascript("globalThis.__sovagridFileReply?.(${JSONObject.quote(message.id)}," +
+            "${JSONObject.quote(message.step)},$accepted);", null)
+    }
+
+    private fun acceptPanelFileMessage(view: WebView, raw: String?, source: Uri,
+                                      mainFrame: Boolean, port: Int) {
+        if (!mainFrame || view !== browser || !visible || disposed || isFinishing || !panelReady(port) ||
+            source.scheme != "http" || source.authority != "127.0.0.1:$port" ||
+            source.path !in listOf(null, "", "/") || source.query != null || source.fragment != null ||
+            raw == null || raw.length > 90000) return
+        val message = try {
+            val json = JSONObject(raw)
+            PanelFileMessage.decode(json.keys().asSequence().associateWith { key ->
+                json.opt(key).takeUnless { it == JSONObject.NULL }
+            })
+        } catch (_: Exception) { null }
+        if (message == null) return
+        if (message.op == "start") {
+            if (panelDownload != null || fileDownloadDialog != null || uploadChooser != null ||
+                profilePickerActive || profileSaveInProgress || pendingProfile != null) {
+                replyPanelFile(view, message, false); return
+            }
+            val dialog = AlertDialog.Builder(this).setTitle("Скачать файл?")
+                .setMessage("${message.filename}\n\nФайл может содержать пароли и ключи сервера. Он будет загружен через текущий SSH-туннель, затем вы выберете место сохранения. До 32 ГБ; нужно место для временной копии.")
+                .setNegativeButton("Отмена") { _, _ -> replyPanelFile(view, message, false) }
+                .setPositiveButton("Скачать") { _, _ ->
+                    if (view !== browser || !panelReady(port)) replyPanelFile(view, message, false)
+                    else try {
+                        panelDownload = PanelDownloadFile(message.id, message.filename!!, File(cacheDir, "panel-downloads"))
+                        replyPanelFile(view, message, true)
+                    } catch (_: Exception) {
+                        replyPanelFile(view, message, false)
+                        Toast.makeText(this, "Не удалось создать временный файл", Toast.LENGTH_LONG).show()
+                    }
+                }.setOnCancelListener { replyPanelFile(view, message, false) }.create()
+            fileDownloadDialog = dialog
+            dialog.setOnDismissListener { if (fileDownloadDialog === dialog) fileDownloadDialog = null }
+            dialog.show()
+            return
+        }
+        val download = panelDownload
+        if (download == null || download.id != message.id) {
+            replyPanelFile(view, message, false); return
+        }
+        if (message.op == "cancel") {
+            download.close(); panelDownload = null
+            Toast.makeText(this, "Файл не сохранён: передача прервалась, превышен размер или не хватает места", Toast.LENGTH_LONG).show()
+            return
+        }
+        fileWorker.execute {
+            val accepted = try { download.accept(message); true } catch (_: Exception) { download.close(); false }
+            finally { message.data?.fill(0) }
+            runOnUiThread {
+                if (panelDownload !== download || disposed) return@runOnUiThread
+                replyPanelFile(view, message, accepted)
+                if (!accepted) {
+                    panelDownload = null
+                    Toast.makeText(this, "Файл не сохранён: передача прервалась, превышен размер или не хватает места", Toast.LENGTH_LONG).show()
+                } else if (download.complete) {
+                    fileSavePickerActive = true
+                    try {
+                        startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE); type = "application/octet-stream"
+                            putExtra(Intent.EXTRA_TITLE, download.filename)
+                        }, REQUEST_SAVE_PANEL_FILE)
+                    } catch (_: Exception) {
+                        fileSavePickerActive = false; download.close(); panelDownload = null
+                        Toast.makeText(this, "Системный выбор файла недоступен", Toast.LENGTH_LONG).show()
+                    }
+                }
+            }
+        }
+    }
+
+    private fun receivePanelSave(destination: Uri?) {
+        fileSavePickerActive = false
+        val download = panelDownload
+        if (download == null || !download.complete || destination?.scheme != "content") {
+            download?.close(); panelDownload = null; return
+        }
+        fileSaveInProgress = true
+        fileWorker.execute {
+            val saved = try {
+                download.file.inputStream().use { input ->
+                    (contentResolver.openOutputStream(destination, "w") ?: throw IOException()).use { output ->
+                        val buffer = ByteArray(65536)
+                        while (true) {
+                            if (disposed) throw IOException()
+                            val count = input.read(buffer)
+                            if (count < 0) break
+                            output.write(buffer, 0, count)
+                        }
+                        buffer.fill(0); output.flush()
+                    }
+                }
+                true
+            } catch (_: Exception) {
+                // Best effort: document providers may refuse removal of a partial file.
+                try { DocumentsContract.deleteDocument(contentResolver, destination) } catch (_: Exception) { }
+                false
+            } finally { download.close() }
+            runOnUiThread {
+                fileSaveInProgress = false
+                if (panelDownload === download) panelDownload = null
+                if (!disposed) Toast.makeText(this, if (saved) "Файл сохранён" else
+                    "Файл не сохранён. Проверьте, не остался ли неполный файл в выбранной папке.", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private fun receivePanelUpload(uri: Uri?) {
+        uploadPickerActive = false
+        val callback = uploadChooser
+        if (callback == null || uri?.scheme != "content" || browser == null || disposed) {
+            uploadPickerActive = false; uploadChooser = null; callback?.onReceiveValue(null); return
+        }
+        val view = browser
+        fileWorker.execute {
+            val snapshot = try {
+                val name = contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use {
+                    if (it.moveToFirst()) it.getString(0) else null
+                } ?: "upload.bin"
+                if (!PanelFileContract.safeFilename(name)) throw IOException()
+                (contentResolver.openInputStream(uri) ?: throw IOException()).use { input ->
+                    uploadInput = input
+                    PanelUploadFile(input, name, File(cacheDir, "panel-uploads"))
+                }
+            } catch (_: Exception) { null } finally { uploadInput = null }
+            runOnUiThread {
+                uploadPickerActive = false; uploadChooser = null
+                if (snapshot == null || disposed || browser !== view || tunnel?.isOpen != true) {
+                    snapshot?.close(); callback.onReceiveValue(null)
+                    if (!disposed && snapshot == null) Toast.makeText(this, "Выберите один обычный файл до 4 МБ", Toast.LENGTH_LONG).show()
+                } else {
+                    uploadFiles.add(snapshot)
+                    val selected = Uri.Builder().scheme("content").authority("$packageName.panel-files")
+                        .appendPath(snapshot.directory.name).appendPath(snapshot.file.name).build()
+                    callback.onReceiveValue(arrayOf(selected))
+                }
+            }
+        }
+    }
+
+    private fun closeRestoreAccess() {
+        restoreReadId = null
+        restorePicker?.let { try { finishActivity(it.code) } catch (_: Exception) { } }
+        restorePicker = null
+        restoreOpenSignal?.cancel()
+        restoreFiles?.close(); restoreFiles = null
+        restoreOpeningFiles?.close(); restoreOpeningFiles = null
+    }
+
+    private fun replyRestore(view: WebView, request: PanelRestoreMessage, result: JSONObject) {
+        if (browser !== view || disposed || request.session != restoreSession ||
+            tunnel?.isOpen != true) return
+        view.evaluateJavascript("globalThis.__sovagridRestoreReply?.(" + JSONObject.quote(request.session) +
+            "," + JSONObject.quote(request.id) + "," + result.toString() + ");", null)
+    }
+
+    private fun restoreFailure(view: WebView, request: PanelRestoreMessage, message: String) =
+        replyRestore(view, request, JSONObject().put("ok", false).put("error", message))
+
+    private fun acceptRestoreMessage(view: WebView, raw: String?, source: Uri, mainFrame: Boolean, port: Int) {
+        if (view !== browser || !panelReady(port) || !mainFrame || source.scheme != "http" ||
+            source.host != "127.0.0.1" || source.port != port || source.userInfo != null ||
+            source.path !in listOf(null, "", "/") || source.query != null || source.fragment != null ||
+            raw == null || raw.length > 4096) return
+        val request = try {
+            val json = JSONObject(raw)
+            PanelRestoreMessage.decode(json.keys().asSequence().associateWith { json.opt(it).takeUnless { value -> value == JSONObject.NULL } })
+        } catch (_: Exception) { null } ?: return
+        if (request.session != restoreSession) return
+        when (request.action) {
+            "release" -> {
+                closeRestoreAccess()
+                replyRestore(view, request, JSONObject().put("ok", true))
+            }
+            "pick" -> {
+                if (restorePicker != null || restoreOpenSignal != null || uploadChooser != null ||
+                    profilePickerActive || fileSavePickerActive || panelDownload != null ||
+                    fileDownloadDialog != null || nextRestorePickerCode > 60000) {
+                    restoreFailure(view, request, "Сначала завершите текущий выбор или передачу файла."); return
+                }
+                closeRestoreAccess()
+                val pending = RestorePicker(nextRestorePickerCode++, request, view)
+                restorePicker = pending
+                try {
+                    startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                        addCategory(Intent.CATEGORY_OPENABLE); type = "*/*"
+                        putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true)
+                        putExtra(Intent.EXTRA_TITLE, "До пяти файлов копии: до 8 ГБ каждый, до 16 ГБ всего")
+                    }, pending.code)
+                } catch (_: Exception) {
+                    restorePicker = null
+                    restoreFailure(view, request, "Системный выбор файлов недоступен.")
+                }
+            }
+            "read" -> {
+                val files = restoreFiles
+                if (files == null || restoreReadId != null) {
+                    restoreFailure(view, request, "Выбор закрыт или предыдущее чтение ещё не завершено."); return
+                }
+                restoreReadId = request.id
+                fileWorker.execute {
+                    val bytes = try { files.read(request.handle!!, request.offset!!, request.length!!) } catch (_: Exception) { null }
+                    val encoded = bytes?.let { Base64.getEncoder().encodeToString(it) }
+                    bytes?.fill(0)
+                    runOnUiThread {
+                        if (restoreReadId == request.id) restoreReadId = null
+                        if (files !== restoreFiles || request.session != restoreSession) return@runOnUiThread
+                        if (encoded == null) {
+                            files.close(); restoreFiles = null
+                            restoreFailure(view, request, "Файл изменился или недоступен. Скопируйте его на устройство и выберите снова.")
+                        } else replyRestore(view, request, JSONObject().put("ok", true).put("data", encoded))
+                    }
+                }
+            }
+        }
+    }
+
+    private fun receiveRestoreSelection(pending: RestorePicker, uris: List<Uri>) {
+        val (request, view) = pending.request to pending.view
+        if (disposed || browser !== view || request.session != restoreSession || tunnel?.isOpen != true) return
+        if (uris.size !in 1..5 || uris.any { it.scheme != "content" }) {
+            restoreFailure(view, request, if (uris.isEmpty()) "Выбор файлов отменён." else PanelRestoreContract.COPY_MESSAGE); return
+        }
+        val files = PanelRestoreFiles()
+        val cancellation = CancellationSignal()
+        restoreOpeningFiles = files; restoreOpenSignal = cancellation
+        fileWorker.execute {
+            val selected = try { uris.map { files.add(contentResolver, it, cancellation) } } catch (_: Exception) { files.close(); null }
+            runOnUiThread {
+                if (restoreOpenSignal === cancellation) restoreOpenSignal = null
+                if (restoreOpeningFiles === files) restoreOpeningFiles = null
+                if (disposed || browser !== view || request.session != restoreSession || tunnel?.isOpen != true || cancellation.isCanceled) {
+                    files.close(); return@runOnUiThread
+                }
+                if (selected == null) {
+                    restoreFailure(view, request, PanelRestoreContract.COPY_MESSAGE)
+                } else {
+                    restoreFiles?.close(); restoreFiles = files
+                    val list = JSONArray()
+                    selected.forEach { list.put(JSONObject().put("handle", it.handle).put("name", it.name).put("size", it.size)) }
+                    replyRestore(view, request, JSONObject().put("ok", true).put("files", list))
+                }
+            }
+        }
+    }
+
     private fun clearSecretFields() {
         if (::passwordField.isInitialized) passwordField.text?.clear()
         if (::passphraseField.isInitialized) passphraseField.text?.clear()
@@ -1239,6 +1580,7 @@ class PanelActivity : Activity() {
     }
 
     private fun disposeBrowser() {
+        closeRestoreAccess()
         popups.toList().forEach(::disposePopup)
         browser?.apply {
             stopLoading()
@@ -1266,6 +1608,10 @@ class PanelActivity : Activity() {
 
     override fun onStop() {
         visible = false
+        // A system document chooser is part of this panel flow; its result still
+        // needs the authenticated page and tunnel. Ordinary backgrounding closes both.
+        if (uploadPickerActive || fileSavePickerActive || restorePicker != null) { super.onStop(); return }
+        closeRestoreAccess()
         initialHandoff?.clear()
         initialHandoff = null
         activeHandoff?.clear()
@@ -1277,6 +1623,8 @@ class PanelActivity : Activity() {
         clearCopiedPassword(forceIfUnreadable = true)
         bootstrapButton?.isEnabled = false
         panelRetryButton?.isEnabled = false
+        fileDownloadDialog?.dismiss(); fileDownloadDialog = null
+        if (!fileSaveInProgress) { panelDownload?.close(); panelDownload = null }
         if (tunnel != null || opening) {
             val opened = tunnel
             tunnel = null
@@ -1300,6 +1648,12 @@ class PanelActivity : Activity() {
         panelRetryButton = null
         pendingProfile?.bytes?.fill(0)
         pendingProfile = null
+        fileDownloadDialog?.dismiss(); fileDownloadDialog = null
+        uploadChooser?.onReceiveValue(null); uploadChooser = null
+        try { uploadInput?.close() } catch (_: Exception) { }
+        uploadInput = null
+        panelDownload?.close(); panelDownload = null
+        uploadFiles.forEach { it.close() }; uploadFiles.clear()
         clearSecretFields()
         initialHandoff?.clear()
         initialHandoff = null
@@ -1313,6 +1667,7 @@ class PanelActivity : Activity() {
         activeTunnelPort = null
         opened?.close()
         worker.shutdown()
+        fileWorker.shutdown()
         super.onDestroy()
     }
 
@@ -1320,6 +1675,8 @@ class PanelActivity : Activity() {
         private const val REQUEST_PRIVATE_KEY = 71
         private const val REQUEST_SAVE_PROFILE = 72
         private const val REQUEST_GATEWAY_PRIVATE_KEY = 73
+        private const val REQUEST_PANEL_UPLOAD = 74
+        private const val REQUEST_SAVE_PANEL_FILE = 75
         private const val MAX_PROFILE_MESSAGE_LENGTH = 24 * 1024
     }
 }

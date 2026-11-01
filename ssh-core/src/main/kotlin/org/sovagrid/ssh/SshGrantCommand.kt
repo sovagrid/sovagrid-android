@@ -12,7 +12,7 @@ object SshGrantCommand {
         "run --rm --no-deps -T --entrypoint python3 hub " +
         "-m sovagrid_hub --db /data/hub.sqlite ssh-grant"
 
-    val READ_COMMAND = "if [ \"\$(id -u)\" = 0 ]; then $ISSUE; " +
-        "elif command -v sudo >/dev/null 2>&1; then sudo -n $ISSUE; " +
+    val READ_COMMAND = "if [ \"\$(/usr/bin/id -u)\" = 0 ]; then $ISSUE; " +
+        "elif [ -x /usr/bin/sudo ]; then /usr/bin/sudo -n $ISSUE; " +
         "else exit 1; fi"
 }

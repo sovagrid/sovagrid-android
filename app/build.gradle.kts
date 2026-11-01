@@ -20,8 +20,8 @@ android {
         applicationId = "org.sovagrid.android"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.8.0"
+        versionCode = 17
+        versionName = "1.0.0"
         testInstrumentationRunner = "org.sovagrid.android.SshKeyVaultInstrumentation"
     }
 

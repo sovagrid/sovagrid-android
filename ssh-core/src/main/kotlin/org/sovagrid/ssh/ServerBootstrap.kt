@@ -10,7 +10,7 @@ data class FirstInstallJob(val state: FirstInstallState, val stage: String = "",
 
 /** A fixed, detached root job survives phone backgrounding and can be reattached read-only. */
 object ServerBootstrap {
-    const val VERSION = "0.14.0"
+    const val VERSION = "0.14.1"
     const val EXPECTED_SOURCE_SHA256 = "c5786bb64467063196046144e665a98e347f40713facb37809b65a03eb70f347"
     const val EXPECTED_MANIFEST_SHA256 = "ec6f567b0292916dd3f104f1441451708a955b79d02ef91f82237a8cf8603f1f"
     private const val BUNDLE_URL = "https://github.com/sovagrid/sovagrid-blueprint/releases/download/server-v0.14.1/SovaGrid-server-source.tar.gz"
@@ -46,10 +46,11 @@ object ServerBootstrap {
         "  fi",
         "}",
         "check_empty() {",
-        "  [[ \$(id -u) == 0 ]] || refuse ROOT",
+        "  [[ \$(/usr/bin/id -u) == 0 ]] || refuse ROOT",
         "  [[ -r /etc/os-release ]] || refuse UBUNTU",
         "  . /etc/os-release",
         "  [[ \${ID:-} == ubuntu ]] || refuse UBUNTU",
+        "  [[ \${VERSION_ID:-} == 22.04 || \${VERSION_ID:-} == 24.04 || \${VERSION_ID:-} == 26.04 ]] || refuse UBUNTU",
         "  for path in /opt/sovagrid-src /opt/sovagrid-agent /opt/sovagrid-vpn /opt/sovagrid-agent-installer /etc/sovagrid /etc/sovagrid-hub /etc/sovagrid-agent-tunnel /etc/sovagrid-agent-tunnel-public /var/lib/sovagrid /var/lib/sovagrid-agent /var/lib/sovagrid-agent-enrollment /var/lib/sovagrid-hub-tunnels; do",
         "    [[ ! -e \$path && ! -L \$path ]] || refuse EXISTING",
         "  done",
@@ -68,6 +69,16 @@ object ServerBootstrap {
         "[[ ! -L /run/sovagrid-first-install.lock ]] || exit 32",
         "exec 9>/run/sovagrid-first-install.lock",
         "flock -n 9 || exit 33",
+        "installation_lock=/run/sovagrid-installation.lock",
+        "[[ ! -L \$installation_lock ]] || refuse UNKNOWN",
+        "if [[ ! -e \$installation_lock ]]; then",
+        "  ( set -o noclobber; : > \"\$installation_lock\" ) 2>/dev/null || refuse UNKNOWN",
+        "fi",
+        "[[ -f \$installation_lock && \$(stat -c '%u:%g:%a:%h' \"\$installation_lock\") == 0:0:600:1 ]] || refuse UNKNOWN",
+        "exec 6>>\"\$installation_lock\"",
+        "[[ \$(stat -Lc '%d:%i' /proc/self/fd/6) == \"\$(stat -c '%d:%i' \"\$installation_lock\")\" ]] || refuse UNKNOWN",
+        "flock -n 6 || refuse EXISTING",
+        "[[ ! -e /var/lib/.sovagrid-host-restore-in-progress && ! -L /var/lib/.sovagrid-host-restore-in-progress ]] || refuse EXISTING",
         "check_empty",
         "[[ ! -e \$job_dir && ! -L \$job_dir ]] || exit 34",
         "mkdir -m 0700 -- \"\$job_dir\" || exit 35",
@@ -126,7 +137,7 @@ object ServerBootstrap {
         "check_empty",
         "mv -T -- \"\$stage_dir\" /opt/sovagrid-src || refuse STAGE",
         "status_stage RUN",
-        "bash /opt/sovagrid-src/sovagrid-blueprint/run.sh > \"\$job_dir/install.log\" 2>&1 || refuse RUN",
+        "SOVAGRID_INSTALLATION_LOCK_FD=6 bash /opt/sovagrid-src/sovagrid-blueprint/run.sh --with-terminal --with-files --with-wireguard --with-containers > \"\$job_dir/install.log\" 2>&1 || refuse RUN",
         "status_stage CHECK",
         "[[ -f /var/lib/sovagrid/.managed-by-run-sh && ! -L /var/lib/sovagrid/.managed-by-run-sh ]] || refuse RESULT",
         "[[ \$(sha256sum /opt/sovagrid-src/sovagrid-bundle.json | cut -d' ' -f1) == \"\$manifest\" ]] || refuse HASH",
@@ -180,7 +191,7 @@ object ServerBootstrap {
     private fun shellQuote(value: String) = "'" + value.replace("'", "'\\''") + "'"
 
     /** systemd owns the install after this SSH command returns. No profile data is interpolated. */
-    val START_COMMAND: String = "if [ \"\$(id -u)\" != 0 ]; then exit 1; fi; " +
+    private val startScript: String = "if [ \"\$(/usr/bin/id -u)\" != 0 ]; then exit 1; fi; " +
         "if [ -e /var/lib/sovagrid-first-install ] || [ -L /var/lib/sovagrid-first-install ]; then exit 2; fi; " +
         "systemd-run --quiet --collect --unit=sovagrid-first-install " +
         "--property=Type=exec --property=RuntimeMaxSec=2700 " +
@@ -188,8 +199,13 @@ object ServerBootstrap {
         "/bin/bash -c " + shellQuote(jobScript) + " >/dev/null 2>&1 || exit 3; " +
         "printf 'SG_INSTALL_START_V1:OK\\n'"
 
-    val STATUS_COMMAND: String = "if [ \"\$(id -u)\" = 0 ]; then /bin/sh -c " + shellQuote(statusScript) +
-        "; elif command -v sudo >/dev/null 2>&1; then sudo -n /bin/sh -c " + shellQuote(statusScript) +
+    val START_COMMAND: String = "set -- /bin/sh -c " + shellQuote(startScript) + "; " +
+        "if [ \"\$(/usr/bin/id -u)\" = 0 ]; then exec \"\$@\"; " +
+        "elif [ -x /usr/bin/sudo ]; then exec /usr/bin/sudo -n -- \"\$@\"; " +
+        "else exit 1; fi"
+
+    val STATUS_COMMAND: String = "if [ \"\$(/usr/bin/id -u)\" = 0 ]; then /bin/sh -c " + shellQuote(statusScript) +
+        "; elif [ -x /usr/bin/sudo ]; then /usr/bin/sudo -n /bin/sh -c " + shellQuote(statusScript) +
         " 2>/dev/null || printf 'SG_INSTALL_JOB_V1:unknown\\n'; " +
         "else printf 'SG_INSTALL_JOB_V1:unknown\\n'; fi"
 
@@ -223,8 +239,8 @@ object ServerBootstrap {
     }
 
     fun failureText(reason: String): String = when (reason) {
-        "ROOT" -> "Для первой установки нужен вход root по SSH."
-        "UBUNTU" -> "Первая установка поддерживает Ubuntu."
+        "ROOT" -> "Для первой установки нужны root или права sudo без запроса пароля. Пароль SSH не заменяет разрешение sudo."
+        "UBUNTU" -> "Для первой установки нужна Ubuntu 22.04, 24.04 или 26.04 с systemd."
         "EXISTING" -> "На сервере уже есть SovaGrid или заняты его служебные пути."
         "DOWNLOAD", "DOWNLOAD_TOOL" -> "Сервер не смог загрузить пакет. Проверьте доступ к GitHub."
         "HASH" -> "Пакет или манифест не совпали с проверенным SHA-256."
